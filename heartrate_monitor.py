@@ -3,6 +3,22 @@ import hrcalc
 import threading
 import time
 import numpy as np
+import json
+from mqtt_client import Client
+
+
+HR_MONITOR = None
+
+EVENT = threading.Event()
+
+
+def on_message(client, userdata, msg):
+    print("receive: " + msg.topic + " " + str(msg.payload))
+    global HR_MONITOR
+    if HR_MONITOR != None:
+        HR_MONITOR.set_freq(str(msg.payload))
+    # enable the next publish behavior
+    EVENT.set()
 
 
 class HeartRateMonitor(object):
@@ -15,16 +31,83 @@ class HeartRateMonitor(object):
     def __init__(self, print_raw=False, print_result=False):
         self.bpm = 0
         if print_raw is True:
-            print('IR, Red')
+            print("IR, Red")
         self.print_raw = print_raw
         self.print_result = print_result
+        self.client = Client(on_message)
+        self.interval = 1
+        self.cnt = 0
+        self.bo_range = [97, 100]
+        self.bpm_range = [70, 115]
+        global EVENT
+        EVENT.set()
+
+
+    def set_freq(self, resp: str):
+        print("set freq:", resp)
+        data = json.loads(resp)
+        self.interval = data['interval']
+        self.bo_range = [data['data']['bo']['min'], data['data']['bo']['max']]
+        self.bpm_range = [data['data']['bpm']['min'], data['data']['bpm']['max']]
+
+
+    def process_result(self, bpm, spo2):
+        self.cnt += 1
+        if (
+            bpm < self.bpm_range[0]
+            or bpm > self.bpm_range[1]
+            or spo2 < self.bo_range[0]
+            or spo2 > self.bo_range[1]
+        ):
+            # detected exception
+            self.interval = 1
+
+        if self.cnt >= self.interval:
+            if self.print_result:
+                print("BPM: {0}, SpO2: {1}".format(bpm, spo2))
+            self.publish(bpm, spo2)
+            self.cnt = 0
+
+
+    # def publish_thread(self, data):
+    #     EVENT.wait()
+    #     print("publish_thread: data: ", data)
+    #     self.client.publish(data)        
+    #     EVENT.clear()
+
+    # Note that this method may block until recv the response from the server
+    def publish(self, bpm, spo2):
+        data = {}
+        data['type'] = 1
+        data['data'] = {}
+        data['data']['id'] = 180
+        data['data']['bo'] = spo2
+        data['data']['bpm'] = bpm
+        data['data']['lo'] = "home"
+        data_str = json.dumps(data)
+
+        print("publish: data: ", data_str)
+
+        # t = threading.Thread(target=self.publish_thread, args=(self, data_str))
+        # EVENT.wait()
+        # self.client.publish(data_str)        
+        # EVENT.clear()
+        if EVENT.is_set():
+            self.client.publish(data_str)        
+
+        print("publish finished", data_str)
+
 
     def run_sensor(self):
+        global HR_MONITOR
+        if HR_MONITOR == None:
+            HR_MONITOR = self
+            
         sensor = MAX30102()
         ir_data = []
         red_data = []
         bpms = []
-        
+
         # data for show
         self.spos = []
         self.bpms = []
@@ -48,23 +131,25 @@ class HeartRateMonitor(object):
                     red_data.pop(0)
 
                 if len(ir_data) == 100:
-                    bpm, valid_bpm, spo2, valid_spo2 = hrcalc.calc_hr_and_spo2(ir_data, red_data)
+                    bpm, valid_bpm, spo2, valid_spo2 = hrcalc.calc_hr_and_spo2(
+                        ir_data, red_data
+                    )
                     if valid_bpm:
                         bpms.append(bpm)
                         while len(bpms) > 4:
                             bpms.pop(0)
                         self.bpm = np.mean(bpms)
-                        if (np.mean(ir_data) < 50000 and np.mean(red_data) < 50000):
+                        if np.mean(ir_data) < 50000 and np.mean(red_data) < 50000:
                             self.bpm = 0
                             if self.print_result:
                                 print("Finger not detected")
-                        if self.print_result:
-                            
-                            print("BPM: {0}, SpO2: {1}".format(self.bpm, spo2))
-                            
+                        # else:
+                        # sss self.client.publish()
+
                         if spo2 > 0:
                             self.bpms.append(self.bpm)
                             self.spos.append(spo2)
+                            self.process_result(self.bpm, spo2)
 
             time.sleep(self.LOOP_TIME)
 
@@ -83,11 +168,11 @@ class HeartRateMonitor(object):
     def show(self):
         import matplotlib.pyplot as plt
         from scipy.signal import savgol_filter
-        
+
         x = np.arange(len(self.spos))
         y = np.array(self.spos)
-    
+
         yhat = savgol_filter(y, 51, 3)
-    
+
         plt.plot(x, yhat)
         plt.show()
